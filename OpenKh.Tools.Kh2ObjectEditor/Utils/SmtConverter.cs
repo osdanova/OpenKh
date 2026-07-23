@@ -1,5 +1,4 @@
 using OpenKh.Engine;
-using OpenKh.Engine.Extensions;
 using OpenKh.Kh2;
 using OpenKh.Kh2.Models;
 using OpenKh.Tools.Common.Imaging;
@@ -11,7 +10,6 @@ using SimpleModelingToolkit.Core.Nodes;
 using SimpleModelingToolkit.Core.Skinning;
 using SimpleModelingToolkit.Core.Utils;
 using System.Collections.Generic;
-using System.Drawing;
 using System.IO;
 using System.Linq;
 using System.Numerics;
@@ -20,11 +18,23 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
 {
     public class SmtConverter
     {
+        public static SmtScene GetSmtSceneByFile(string modelFilepath, string textureFilepath, string motionFilepath)
+        {
+            ModelSkeletal model = ModelSkeletal.Read(File.OpenRead(modelFilepath));
+            ModelTexture texture = ModelTexture.Read(File.OpenRead(textureFilepath));
+            AnimationBinary  animation = new AnimationBinary(File.OpenRead(motionFilepath));
+            return GetSmtScene(model, texture, animation);
+        }
+
         public static SmtScene GetSmtScene()
         {
-            ModelSkeletal kh2Model = MdlxService.Instance.ModelFile;
-            ModelTexture kh2TextureFile = MdlxService.Instance.TextureFile;
-            AnimationBinary kh2Animation = MsetService.Instance.LoadedMotion;
+            return GetSmtScene(null, null, null);
+        }
+        public static SmtScene GetSmtScene(ModelSkeletal kh2Model, ModelTexture kh2TextureFile, AnimationBinary kh2Animation)
+        {
+            if(kh2Model == null) kh2Model = MdlxService.Instance.ModelFile;
+            if (kh2TextureFile == null) kh2TextureFile = MdlxService.Instance.TextureFile;
+            if (kh2Animation == null) kh2Animation = MsetService.Instance.LoadedMotion;
 
             SmtScene scene = new SmtScene();
 
@@ -149,25 +159,25 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 }
 
                 // Constraints
-                foreach(var constraint in kh2Animation.MotionFile.Constraints)
-                {
-                    if(constraint.Type == 0)
-                    {
-                        SmtAnimationJoint sourceJoint = animation.JointAnimations[constraint.SourceJointId];
-                        SmtAnimationJoint constrainedJoint = animation.JointAnimations[constraint.ConstrainedJointId];
-
-                        foreach(float time in keyframeTimes)
-                        {
-                            Vector3 pos = sourceJoint.Keyframes[time].Translation.Value;
-                            int parentId = model.Armature.Joints[constraint.ConstrainedJointId].ParentId;
-                            SmtAnimationJoint parentJoint = animation.JointAnimations[parentId];
-                            pos = pos - parentJoint.Keyframes[time].Translation.Value;
-
-                            constrainedJoint.Keyframes[time].Translation = pos;
-                        }
-                        constrainedJoint.Keyframes = sourceJoint.Keyframes;
-                    }
-                }
+                //foreach(var constraint in kh2Animation.MotionFile.Constraints)
+                //{
+                //    if(constraint.Type == 0)
+                //    {
+                //        SmtAnimationJoint sourceJoint = animation.JointAnimations[constraint.SourceJointId];
+                //        SmtAnimationJoint constrainedJoint = animation.JointAnimations[constraint.ConstrainedJointId];
+                //
+                //        foreach(float time in keyframeTimes)
+                //        {
+                //            Vector3 pos = sourceJoint.Keyframes[time].Translation.Value;
+                //            int parentId = model.Armature.Joints[constraint.ConstrainedJointId].ParentId;
+                //            SmtAnimationJoint parentJoint = animation.JointAnimations[parentId];
+                //            pos = pos - parentJoint.Keyframes[time].Translation.Value;
+                //
+                //            constrainedJoint.Keyframes[time].Translation = pos;
+                //        }
+                //        constrainedJoint.Keyframes = sourceJoint.Keyframes;
+                //    }
+                //}
 
                 foreach (var jointAnim in animation.JointAnimations) {
                     jointAnim.SortKeyframes();
@@ -219,6 +229,16 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 scales[i] = new Vector3(bone.ScaleX, bone.ScaleY, bone.ScaleZ);
                 rotations[i] = new Vector3(bone.RotationX, bone.RotationY, bone.RotationZ);
                 translations[i] = new Vector3(bone.TranslationX, bone.TranslationY, bone.TranslationZ);
+            }
+
+            // IK helper base pose, taken from each helper's own rest transform
+            for (int i = 0; i < motionFile.IKHelpers.Count; i++)
+            {
+                Motion.IKHelper ikHelper = motionFile.IKHelpers[i];
+                int jointId = baseBoneCount + i;
+                scales[jointId] = new Vector3(ikHelper.ScaleX, ikHelper.ScaleY, ikHelper.ScaleZ);
+                rotations[jointId] = new Vector3(ikHelper.RotateX, ikHelper.RotateY, ikHelper.RotateZ);
+                translations[jointId] = new Vector3(ikHelper.TranslateX, ikHelper.TranslateY, ikHelper.TranslateZ);
             }
 
             // Initial pose overrides
