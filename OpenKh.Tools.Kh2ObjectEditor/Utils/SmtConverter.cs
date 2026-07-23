@@ -218,6 +218,15 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
             for (int i = boneCount; i < totalJointCount; i++)
                 parentIds[i] = motionFile.IKHelpers[i - boneCount].ParentId;
 
+            // A joint whose Flags has the "rotation" bit (0x8) set stores an absolute/world-space rotation rather
+            // than one relative to its parent (verified against the PS2 emulator: a Position-constrained chain's
+            // tip, e.g. an ankle, keeps this flag and its world rotation exactly equals its own local rotation,
+            // completely decoupled from the freshly-bent knee/hip above it) -- see getGlobalTransform.
+            int[] jointFlags = new int[totalJointCount];
+            foreach (Motion.Joint joint in motionFile.Joints)
+                if (joint.JointId >= 0 && joint.JointId < totalJointCount)
+                    jointFlags[joint.JointId] = joint.Flags;
+
             // (root, mid, tip) mirrors a classic 2-bone IK chain: root and mid both need to rotate so tip lands
             // exactly on its target. Crucially, tip's own Constraint must NOT also be applied directly to it (see
             // tipHandledByBend below): that constraint exists to supply the bend's target, not to relocate tip
@@ -290,7 +299,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     {
                         foreach (Motion.Expression expression in expressions)
                         {
-                            float value = evaluateExpression(motionFile, scales, rotations, translations, localMatrices, parentIds, keyTime, expression.NodeId);
+                            float value = evaluateExpression(motionFile, scales, rotations, translations, localMatrices, parentIds, jointFlags, keyTime, expression.NodeId);
                             if (expression.TargetChannel is 3 or 4 or 5)
                                 value = degToRad(value); // Expressions compute rotation in degrees; channels store radians
 
@@ -301,15 +310,37 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
 
                     if (!tipHandledByBend.Contains(jointId) && constraintsByTarget.TryGetValue(jointId, out List<Motion.Constraint> constraints))
                         foreach (Motion.Constraint constraint in constraints)
-                            applyConstraint(motionFile, localMatrices, parentIds, constraint, keyTime);
+                            applyConstraint(motionFile, localMatrices, parentIds, jointFlags, constraint, keyTime);
                 }
 
                 // Pass 3: bend the (root, mid) of each chain identified above so 'tip' reaches the position its
                 // own (deliberately un-applied, see tipHandledByBend above) Constraint's source joint sits at.
                 foreach (var (root, mid, tip, source) in bendChains)
                 {
-                    Vector3 targetPosition = getGlobalTransform(localMatrices, parentIds, source).Translation;
-                    bendTwoBoneChain(localMatrices, parentIds, root, mid, tip, targetPosition);
+                    Vector3 targetPosition = getGlobalTransform(localMatrices, parentIds, jointFlags, source).Translation;
+                    bendTwoBoneChain(localMatrices, parentIds, jointFlags, root, mid, tip, targetPosition);
+                }
+
+                // Pass 4: getGlobalTransform's "rotation absolute" handling (see its own comment) only affects
+                // reads made *during* this function - every downstream consumer of the localMatrices this
+                // function returns (the renderer, callers of this function) does a plain parent-chain FK
+                // composition with no idea that flag exists. Bake the correction into the stored local matrix
+                // itself, for every such joint, so plain composition reproduces the same result.
+                for (int i = 0; i < totalJointCount; i++)
+                {
+                    if ((jointFlags[i] & 0x8) == 0)
+                        continue;
+
+                    Matrix4x4 desiredWorld = getGlobalTransform(localMatrices, parentIds, jointFlags, i);
+                    int parent = parentIds[i];
+                    if (parent < 0)
+                    {
+                        localMatrices[i] = desiredWorld;
+                        continue;
+                    }
+
+                    Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, jointFlags, parent), out Matrix4x4 parentWorldInverse);
+                    localMatrices[i] = desiredWorld * parentWorldInverse;
                 }
 
                 frameMatrices.Add(keyTime, localMatrices);
@@ -336,18 +367,30 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
         // Resolves a joint's absolute (world-space) transform by walking up through its (mutable) local matrices.
         // Recursive rather than a single flat pass, since a Constraint can rewrite an ancestor's local matrix
         // *after* a descendant was already visited earlier in Joints order, and later reads must see that update.
-        private static Matrix4x4 getGlobalTransform(Matrix4x4[] localMatrices, int[] parentIds, int index)
+        //
+        // A joint whose Flags has the "rotation" bit (0x8) set carries an absolute rotation: its world rotation
+        // is its own local rotation exactly, not composed with the parent chain at all (position still composes
+        // normally). This matters for a bend chain's tip (e.g. an ankle): once the knee/hip above it are bent to
+        // reach the IK target, the tip's baked rotation was never meant to inherit that freshly-solved parent
+        // orientation, only to sit at the right world position.
+        private static Matrix4x4 getGlobalTransform(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int index)
         {
             if (index < 0)
                 return Matrix4x4.Identity;
 
             int parent = parentIds[index];
-            return parent < 0 ? localMatrices[index] : localMatrices[index] * getGlobalTransform(localMatrices, parentIds, parent);
+            Matrix4x4 composed = parent < 0 ? localMatrices[index] : localMatrices[index] * getGlobalTransform(localMatrices, parentIds, jointFlags, parent);
+
+            if ((jointFlags[index] & 0x8) == 0)
+                return composed;
+
+            Matrix4x4.Decompose(localMatrices[index], out Vector3 scale, out Quaternion localRotation, out _);
+            return Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(localRotation) * Matrix4x4.CreateTranslation(composed.Translation);
         }
 
         // Back-solves the local matrix needed so that this joint's *global* transform becomes 'global',
         // given its current parent chain.
-        private static void setGlobalTransform(Matrix4x4[] localMatrices, int[] parentIds, int index, Matrix4x4 global)
+        private static void setGlobalTransform(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int index, Matrix4x4 global)
         {
             int parent = parentIds[index];
             if (parent < 0)
@@ -356,8 +399,19 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 return;
             }
 
-            Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, parent), out Matrix4x4 parentGlobalInverse);
-            localMatrices[index] = global * parentGlobalInverse;
+            if ((jointFlags[index] & 0x8) != 0)
+            {
+                // Rotation is absolute for this joint: keep it as-is (it isn't derived from the parent), only
+                // back-solve the local translation needed to place it at global's position.
+                Matrix4x4.Decompose(localMatrices[index], out Vector3 scale, out Quaternion localRotation, out _);
+                Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, jointFlags, parent), out Matrix4x4 parentGlobalInverse);
+                Vector3 localTranslation = Vector3.Transform(global.Translation, parentGlobalInverse);
+                localMatrices[index] = Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(localRotation) * Matrix4x4.CreateTranslation(localTranslation);
+                return;
+            }
+
+            Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, jointFlags, parent), out Matrix4x4 parentInverse);
+            localMatrices[index] = global * parentInverse;
         }
 
         // FCurvesForward.JointId already matches the combined joint space (bones start at 0); FCurvesInverse.JointId
@@ -438,7 +492,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
 
         // Applies one Constraint by directly overwriting the target joint's global position/rotation/scale --
         // KH2 constraints do not bend anything at runtime, they just copy a component from the source joint.
-        private static void applyConstraint(Motion.InterpolatedMotion motionFile, Matrix4x4[] localMatrices, int[] parentIds, Motion.Constraint constraint, float keyTime)
+        private static void applyConstraint(Motion.InterpolatedMotion motionFile, Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, Motion.Constraint constraint, float keyTime)
         {
             if (!isConstraintActive(motionFile, constraint, keyTime))
                 return;
@@ -450,23 +504,23 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
             {
                 case Motion.ConstraintType.POSITION:
                 {
-                    Matrix4x4 current = getGlobalTransform(localMatrices, parentIds, target);
-                    current.Translation = getGlobalTransform(localMatrices, parentIds, source).Translation;
-                    setGlobalTransform(localMatrices, parentIds, target, current);
+                    Matrix4x4 current = getGlobalTransform(localMatrices, parentIds, jointFlags, target);
+                    current.Translation = getGlobalTransform(localMatrices, parentIds, jointFlags, source).Translation;
+                    setGlobalTransform(localMatrices, parentIds, jointFlags, target, current);
                     break;
                 }
                 case Motion.ConstraintType.ORIENTATION:
                 {
-                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, target), out Vector3 scale, out _, out Vector3 translation);
-                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, source), out _, out Quaternion sourceRotation, out _);
-                    setGlobalTransform(localMatrices, parentIds, target, Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(sourceRotation) * Matrix4x4.CreateTranslation(translation));
+                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, jointFlags, target), out Vector3 scale, out _, out Vector3 translation);
+                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, jointFlags, source), out _, out Quaternion sourceRotation, out _);
+                    setGlobalTransform(localMatrices, parentIds, jointFlags, target, Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(sourceRotation) * Matrix4x4.CreateTranslation(translation));
                     break;
                 }
                 case Motion.ConstraintType.SCALE:
                 {
-                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, target), out _, out Quaternion rotation, out Vector3 translation);
-                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, source), out Vector3 sourceScale, out _, out _);
-                    setGlobalTransform(localMatrices, parentIds, target, Matrix4x4.CreateScale(sourceScale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation));
+                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, jointFlags, target), out _, out Quaternion rotation, out Vector3 translation);
+                    Matrix4x4.Decompose(getGlobalTransform(localMatrices, parentIds, jointFlags, source), out Vector3 sourceScale, out _, out _);
+                    setGlobalTransform(localMatrices, parentIds, jointFlags, target, Matrix4x4.CreateScale(sourceScale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation));
                     break;
                 }
                 default:
@@ -486,9 +540,9 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
         // to be -- a fixed-axis solve leaves a permanent, unresolvable residual along that axis no matter how
         // many sweeps run. Recomputing the axis from the *current* effector/target vectors at each step removes
         // that restriction and lets the solve reach any reachable target in full 3D.
-        private static void bendTwoBoneChain(Matrix4x4[] localMatrices, int[] parentIds, int root, int mid, int tip, Vector3 targetPosition)
+        private static void bendTwoBoneChain(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int root, int mid, int tip, Vector3 targetPosition)
         {
-            Vector3 rootPos = getGlobalTransform(localMatrices, parentIds, root).Translation;
+            Vector3 rootPos = getGlobalTransform(localMatrices, parentIds, jointFlags, root).Translation;
             if (Vector3.Distance(rootPos, targetPosition) < 1e-5f)
                 return; // Target sits on the root joint; nothing meaningful to solve
 
@@ -499,8 +553,8 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
             {
                 foreach (int joint in chain)
                 {
-                    Vector3 pivot = getGlobalTransform(localMatrices, parentIds, joint).Translation;
-                    Vector3 toEffector = getGlobalTransform(localMatrices, parentIds, tip).Translation - pivot;
+                    Vector3 pivot = getGlobalTransform(localMatrices, parentIds, jointFlags, joint).Translation;
+                    Vector3 toEffector = getGlobalTransform(localMatrices, parentIds, jointFlags, tip).Translation - pivot;
                     Vector3 toTarget = targetPosition - pivot;
                     if (toEffector.LengthSquared() < 1e-10f || toTarget.LengthSquared() < 1e-10f)
                         continue;
@@ -512,7 +566,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
 
                     float angle = MathF.Acos(Math.Clamp(Vector3.Dot(Vector3.Normalize(toEffector), Vector3.Normalize(toTarget)), -1f, 1f));
                     Quaternion delta = Quaternion.CreateFromAxisAngle(axis, angle);
-                    setGlobalTransform(localMatrices, parentIds, joint, rotateGlobalAroundOwnPosition(getGlobalTransform(localMatrices, parentIds, joint), delta));
+                    setGlobalTransform(localMatrices, parentIds, jointFlags, joint, rotateGlobalAroundOwnPosition(getGlobalTransform(localMatrices, parentIds, jointFlags, joint), delta));
                 }
             }
         }
@@ -630,7 +684,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
         // channels themselves store radians, hence the degToRad/radToDeg conversions sprinkled through this switch.
         private static float evaluateExpression(
             Motion.InterpolatedMotion motionFile, Vector3[] scales, Vector3[] rotations, Vector3[] translations,
-            Matrix4x4[] localMatrices, int[] parentIds, float keyTime, int index)
+            Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, float keyTime, int index)
         {
             if (index < 0 || index >= motionFile.ExpressionNodes.Count)
                 return 0f;
@@ -638,7 +692,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
             Motion.ExpressionNode node = motionFile.ExpressionNodes[index];
             Motion.ExpressionType nodeType = getExpressionNodeType(node);
 
-            float Evaluate(int childIndex) => evaluateExpression(motionFile, scales, rotations, translations, localMatrices, parentIds, keyTime, childIndex);
+            float Evaluate(int childIndex) => evaluateExpression(motionFile, scales, rotations, translations, localMatrices, parentIds, jointFlags, keyTime, childIndex);
 
             switch (nodeType)
             {
@@ -671,7 +725,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 {
                     if (node.CAR >= 0 && isExpressionListNode(motionFile, node.CAR) && node.CDR < 0)
                     {
-                        List<float> list = evaluateExpressionList(motionFile, scales, rotations, translations, localMatrices, parentIds, keyTime, node.CAR);
+                        List<float> list = evaluateExpressionList(motionFile, scales, rotations, translations, localMatrices, parentIds, jointFlags, keyTime, node.CAR);
                         return list.Count == 0 ? 0f : list.Sum() / list.Count;
                     }
                     return 0f;
@@ -680,7 +734,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 {
                     if (node.CAR >= 0 && isExpressionListNode(motionFile, node.CAR) && node.CDR < 0)
                     {
-                        List<float> list = evaluateExpressionList(motionFile, scales, rotations, translations, localMatrices, parentIds, keyTime, node.CAR);
+                        List<float> list = evaluateExpressionList(motionFile, scales, rotations, translations, localMatrices, parentIds, jointFlags, keyTime, node.CAR);
                         if (list.Count == 3)
                             return list[0] >= 0 ? list[1] : list[2];
                     }
@@ -702,8 +756,8 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     int totalCount = scales.Length;
                     int bone1 = node.CAR < 0 || node.CAR >= totalCount ? 0 : node.CAR;
                     int bone2 = node.CDR < 0 || node.CDR >= totalCount ? 0 : node.CDR;
-                    Vector3 pos1 = getGlobalTransform(localMatrices, parentIds, bone1).Translation;
-                    Vector3 pos2 = getGlobalTransform(localMatrices, parentIds, bone2).Translation;
+                    Vector3 pos1 = getGlobalTransform(localMatrices, parentIds, jointFlags, bone1).Translation;
+                    Vector3 pos2 = getGlobalTransform(localMatrices, parentIds, jointFlags, bone2).Translation;
                     return Vector3.Distance(pos1, pos2);
                 }
                 case Motion.ExpressionType.FUNC_FMOD: return Evaluate(node.CAR) % Evaluate(node.CDR);
@@ -743,7 +797,7 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
 
         private static List<float> evaluateExpressionList(
             Motion.InterpolatedMotion motionFile, Vector3[] scales, Vector3[] rotations, Vector3[] translations,
-            Matrix4x4[] localMatrices, int[] parentIds, float keyTime, int index)
+            Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, float keyTime, int index)
         {
             Motion.ExpressionNode node = motionFile.ExpressionNodes[index];
             List<float> list = new List<float>();
@@ -754,9 +808,9 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     return;
 
                 if (isExpressionListNode(motionFile, childIndex))
-                    list.AddRange(evaluateExpressionList(motionFile, scales, rotations, translations, localMatrices, parentIds, keyTime, childIndex));
+                    list.AddRange(evaluateExpressionList(motionFile, scales, rotations, translations, localMatrices, parentIds, jointFlags, keyTime, childIndex));
                 else
-                    list.Add(evaluateExpression(motionFile, scales, rotations, translations, localMatrices, parentIds, keyTime, childIndex));
+                    list.Add(evaluateExpression(motionFile, scales, rotations, translations, localMatrices, parentIds, jointFlags, keyTime, childIndex));
             }
 
             AddBranch(node.CAR);
