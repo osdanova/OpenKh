@@ -10,3 +10,6 @@
 [submodule "ModelingToolkit"]
 	path = ModelingToolkit
 	url = https://github.com/osdanova/ModelingToolkit.git
+[submodule "SimpleModelingToolkit"]
+	path = SimpleModelingToolkit
+	url = https://github.com/osdanova/SimpleModelingToolkit.git
