@@ -197,8 +197,8 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
         //     children gets yanked to a Constraint target (e.g. a hip bone bending so a position-constrained
         //     knee/ankle chain reaches its IK Helper target). Bending uses Cyclic Coordinate Descent with a
         //     resolution plane derived from live root/mid/target geometry, per kenjiuno/msetDoc.
-        // Only Constraint types Position/Orientation/Scale are applied; Path/Direction/UpVector/TwoPoints/
-        // Camera*/Int*/Limiters are not implemented.
+        // Constraint types Position/Orientation/Scale/Direction/Up-Vector are applied; Path/TwoPoints/Camera*/
+        // Int*/Limiters are not implemented.
         public static Dictionary<float, Matrix4x4[]> getMatricesForKeyFrames(ModelSkeletal model, AnimationBinary animation, HashSet<float> keyframeTimes)
         {
             Motion.InterpolatedMotion motionFile = animation.MotionFile;
@@ -237,7 +237,19 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
             foreach (Motion.Joint joint in motionFile.Joints)
             {
                 int mid = joint.JointId;
-                if (mid >= boneCount || (joint.Flags & 0x20) == 0 || constraintsByTarget.ContainsKey(mid))
+                // Two different rigs in the wild mark a bend chain's mid-joint two different ways: one sets the
+                // "calculated" bit (0x20) with ik=0, the other sets ik=1 (bits 0-1) with calculated unset. Accept
+                // either - a mid-joint candidate that isn't actually followed by a position-constrained child
+                // (the loop below) is simply never turned into a bend chain, so this is safe to widen.
+                bool isBendMidCandidate = (joint.Flags & 0x20) != 0 || (joint.Flags & 0x3) == 1;
+                // A Position constraint on the mid itself would conflict with bending it (that's what marks a
+                // *tip*, not a mid). An Up-Vector (or other non-Position) constraint on the mid is compatible,
+                // though: it just twists roll around the aim axis after the bend already placed it, applied via
+                // the ordinary per-joint constraint pass later in this same Joints-order iteration (Pass 2) since
+                // the mid is never added to tipHandledByBend.
+                bool midHasPositionConstraint = constraintsByTarget.TryGetValue(mid, out List<Motion.Constraint> midConstraints)
+                    && midConstraints.Any(c => (Motion.ConstraintType)c.Type == Motion.ConstraintType.POSITION);
+                if (mid >= boneCount || !isBendMidCandidate || midHasPositionConstraint)
                     continue;
 
                 int root = model.Bones[mid].ParentIndex;
@@ -257,6 +269,75 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     tipHandledByBend.Add(child);
                     break;
                 }
+            }
+
+            // Some chains (ribbons/strips/rope-like accessories, as opposed to a plain 2-bone limb) don't stop at
+            // one Position-constrained tip: every joint further down the same strip is *also* individually
+            // Position-constrained to its own IK Helper (e.g. tip -> another constrained child -> another
+            // constrained child -> ...). Only the first link needs a real 2-bone bend (root+mid both rotate);
+            // every link after that is a single joint whose one and only child is a fixed bone-length away, so
+            // just aiming that single joint at its child's next target is both necessary and sufficient - no
+            // root/mid ambiguity to resolve since there's only one way to reach a point that's already exactly
+            // one fixed-length bone away.
+            List<(int pivot, int tip, int source)> aimChains = new List<(int, int, int)>();
+            foreach (var (_, _, initialTip, _) in bendChains)
+            {
+                int pivot = initialTip;
+                while (true)
+                {
+                    int next = -1;
+                    Motion.Constraint nextPosConstraint = null;
+                    for (int child = 0; child < boneCount; child++)
+                    {
+                        if (model.Bones[child].ParentIndex != pivot || tipHandledByBend.Contains(child))
+                            continue;
+                        if (!constraintsByTarget.TryGetValue(child, out List<Motion.Constraint> childConstraints))
+                            continue;
+
+                        Motion.Constraint posConstraint = childConstraints.FirstOrDefault(c => (Motion.ConstraintType)c.Type == Motion.ConstraintType.POSITION);
+                        if (posConstraint == null)
+                            continue;
+
+                        next = child;
+                        nextPosConstraint = posConstraint;
+                        break;
+                    }
+
+                    if (next < 0)
+                        break;
+
+                    aimChains.Add((pivot, next, nextPosConstraint.SourceJointId));
+                    tipHandledByBend.Add(next);
+                    pivot = next;
+                }
+            }
+
+            // The "rotation" flag (0x8) only means "world rotation decoupled from parent" for a bend/aim chain's
+            // own tip - that's the sole scenario verified against the PS2 emulator (an ankle keeping its baked
+            // rotation while the freshly-bent knee/hip above it move). Some rigs (e.g. a large multi-limbed boss)
+            // set this same bit on ordinary FK-only ancestor bones for an unrelated reason; honoring it there
+            // discards a real parent rotation and sends the whole subtree in the wrong direction. Mask it off
+            // everywhere except confirmed tips.
+            for (int i = 0; i < totalJointCount; i++)
+                if ((jointFlags[i] & 0x8) != 0 && !tipHandledByBend.Contains(i))
+                    jointFlags[i] &= ~0x8;
+
+            // Looked up per-joint (keyed by mid/pivot) so the bend/aim/Up-Vector/regular-constraint resolution
+            // below can all happen in a single Joints-order traversal (see Pass 2) instead of separate passes.
+            // That matters whenever one resolved chain's tip is itself an ancestor of another joint resolved a
+            // different way (e.g. a "stretchy" Position-constrained joint hanging off a limb whose own shoulder
+            // is, further up, the mid of an ordinary 2-bone bend): resolving them in separate batched passes
+            // means whichever batch runs second silently drags along anything downstream of the first, since
+            // rotating an ancestor after a descendant's position was already locked in always moves it. A single
+            // pass in parent-before-child order (Joints is ordered this way throughout this file) sidesteps that
+            // entirely - by the time a joint's own constraint is resolved, every ancestor is already final.
+            Dictionary<int, (int root, int tip, int source)> bendChainByMid = bendChains.ToDictionary(bc => bc.mid, bc => (bc.root, bc.tip, bc.source));
+            Dictionary<int, List<(int tip, int source)>> aimStepsByPivot = new Dictionary<int, List<(int, int)>>();
+            foreach (var (pivot, tip, source) in aimChains)
+            {
+                if (!aimStepsByPivot.TryGetValue(pivot, out List<(int, int)> steps))
+                    aimStepsByPivot[pivot] = steps = new List<(int, int)>();
+                steps.Add((tip, source));
             }
 
             Dictionary<float, Matrix4x4[]> frameMatrices = new Dictionary<float, Matrix4x4[]>();
@@ -290,7 +371,12 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     localMatrices[i] = buildLocalMatrix(scales[i], rotations[i], translations[i]);
                 }
 
-                // Pass 2: Expressions then Constraints, per joint, in the file's own Joints traversal order
+                // Pass 2: Expressions, then bend/aim-chain resolution, then regular Constraints - all per joint,
+                // in the file's own Joints traversal order (parent before child throughout this file). Bend/aim
+                // chains are resolved exactly when the loop reaches their mid/pivot joint, rather than in a
+                // separate later pass, specifically so a joint further down the same lineage that depends on
+                // this one (whether via a regular constraint's back-solve or another bend/aim step) always sees
+                // its final rotation - see the comment on bendChainByMid/aimStepsByPivot above.
                 foreach (Motion.Joint joint in motionFile.Joints)
                 {
                     int jointId = joint.JointId;
@@ -308,20 +394,25 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                         }
                     }
 
+                    if (bendChainByMid.TryGetValue(jointId, out var bendChain))
+                    {
+                        Vector3 targetPosition = getGlobalTransform(localMatrices, parentIds, jointFlags, bendChain.source).Translation;
+                        bendTwoBoneChain(localMatrices, parentIds, jointFlags, bendChain.root, jointId, bendChain.tip, targetPosition);
+                    }
+
+                    if (aimStepsByPivot.TryGetValue(jointId, out List<(int tip, int source)> aimSteps))
+                        foreach (var (tip, source) in aimSteps)
+                        {
+                            Vector3 targetPosition = getGlobalTransform(localMatrices, parentIds, jointFlags, source).Translation;
+                            aimChildTowardTarget(localMatrices, parentIds, jointFlags, jointId, tip, targetPosition);
+                        }
+
                     if (!tipHandledByBend.Contains(jointId) && constraintsByTarget.TryGetValue(jointId, out List<Motion.Constraint> constraints))
                         foreach (Motion.Constraint constraint in constraints)
                             applyConstraint(motionFile, localMatrices, parentIds, jointFlags, constraint, keyTime);
                 }
 
-                // Pass 3: bend the (root, mid) of each chain identified above so 'tip' reaches the position its
-                // own (deliberately un-applied, see tipHandledByBend above) Constraint's source joint sits at.
-                foreach (var (root, mid, tip, source) in bendChains)
-                {
-                    Vector3 targetPosition = getGlobalTransform(localMatrices, parentIds, jointFlags, source).Translation;
-                    bendTwoBoneChain(localMatrices, parentIds, jointFlags, root, mid, tip, targetPosition);
-                }
-
-                // Pass 4: getGlobalTransform's "rotation absolute" handling (see its own comment) only affects
+                // Pass 3: getGlobalTransform's "rotation absolute" handling (see its own comment) only affects
                 // reads made *during* this function - every downstream consumer of the localMatrices this
                 // function returns (the renderer, callers of this function) does a plain parent-chain FK
                 // composition with no idea that flag exists. Bake the correction into the stored local matrix
@@ -523,8 +614,62 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     setGlobalTransform(localMatrices, parentIds, jointFlags, target, Matrix4x4.CreateScale(sourceScale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation));
                     break;
                 }
+                case Motion.ConstraintType.DIRECTION:
+                {
+                    // Per Softimage's docs, Direction aligns a chosen local axis (default: local X) of the
+                    // target at the source, changing only orientation. A separate Up-Vector constraint (a
+                    // distinct Constraint entry, type UP_VECTOR) would normally control roll/twist around that
+                    // axis; none targets this joint here, and empirically (checked against the PS2 emulator)
+                    // the up-vector Softimage falls back to in that case is the target's own parent's current
+                    // Y axis, not world-up or the target's own pre-constraint roll - i.e. a classic look-at
+                    // using the parent's orientation as the up reference.
+                    Matrix4x4 targetWorld = getGlobalTransform(localMatrices, parentIds, jointFlags, target);
+                    Matrix4x4.Decompose(targetWorld, out Vector3 scale, out _, out Vector3 targetWorldPos);
+                    Vector3 sourceWorldPos = getGlobalTransform(localMatrices, parentIds, jointFlags, source).Translation;
+                    Vector3 aimDirWorld = sourceWorldPos - targetWorldPos;
+                    if (aimDirWorld.LengthSquared() > 1e-12f)
+                    {
+                        aimDirWorld = Vector3.Normalize(aimDirWorld);
+
+                        int parent = parentIds[target];
+                        Vector3 upRef = parent < 0
+                            ? Vector3.UnitY
+                            : Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, getGlobalTransform(localMatrices, parentIds, jointFlags, parent)));
+
+                        Vector3 zAxis = Vector3.Cross(aimDirWorld, upRef);
+                        if (zAxis.LengthSquared() < 1e-10f)
+                            zAxis = Vector3.Cross(aimDirWorld, Math.Abs(aimDirWorld.Y) < 0.99f ? Vector3.UnitY : Vector3.UnitX);
+                        zAxis = Vector3.Normalize(zAxis);
+                        Vector3 yAxis = Vector3.Normalize(Vector3.Cross(zAxis, aimDirWorld));
+
+                        Matrix4x4 newWorldRotationMatrix = new Matrix4x4(
+                            aimDirWorld.X, aimDirWorld.Y, aimDirWorld.Z, 0,
+                            yAxis.X, yAxis.Y, yAxis.Z, 0,
+                            zAxis.X, zAxis.Y, zAxis.Z, 0,
+                            0, 0, 0, 1);
+
+                        setGlobalTransform(localMatrices, parentIds, jointFlags, target,
+                            Matrix4x4.CreateScale(scale) * newWorldRotationMatrix * Matrix4x4.CreateTranslation(targetWorldPos));
+                    }
+                    break;
+                }
+                case Motion.ConstraintType.UP_VECTOR:
+                {
+                    // Constrains the target's local Y axis toward the source, fixing roll/twist around whatever
+                    // aim direction the target already has (from its own baked rotation, or from a bend/aim
+                    // chain resolved earlier in this same Joints-order pass) - see applyUpVectorTwist. Must run
+                    // here in Pass 2, not after the bend/aim chains: this joint's *child*, if it has its own
+                    // independent Position constraint (a free "stretch to position", not a rigid continuation
+                    // of the limb), gets resolved later in this same Joints-order traversal by back-solving its
+                    // local matrix against this joint's *current* world rotation - so the twist has to be locked
+                    // in before that back-solve happens, or the child's fixed local offset ends up composed
+                    // against the wrong parent orientation and the position drifts.
+                    Vector3 upTargetPosition = getGlobalTransform(localMatrices, parentIds, jointFlags, source).Translation;
+                    applyUpVectorTwist(localMatrices, parentIds, jointFlags, target, upTargetPosition);
+                    break;
+                }
                 default:
-                    break; // Path/Direction/UpVector/TwoPoints/Camera*/Int*/Limiters are not implemented
+                    break; // Path/TwoPoints/Camera*/Int*/Limiters are not implemented
             }
         }
 
@@ -569,6 +714,68 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                     setGlobalTransform(localMatrices, parentIds, jointFlags, joint, rotateGlobalAroundOwnPosition(getGlobalTransform(localMatrices, parentIds, jointFlags, joint), delta));
                 }
             }
+        }
+
+        // Rotates a single joint ('pivot') so its one and only child ('tip', a fixed bone-length away) lands
+        // exactly on 'targetPosition'. Unlike bendTwoBoneChain, this has no root/mid ambiguity to solve - a
+        // single joint has exactly one rotation (up to twist around the aim axis, which is left as whatever
+        // swing gets you there, i.e. the existing roll is disturbed as little as possible) that points a fixed-
+        // length child at any reachable target, so one direct swing is both necessary and sufficient; no
+        // iterative sweep needed.
+        private static void aimChildTowardTarget(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int pivot, int tip, Vector3 targetPosition)
+        {
+            Matrix4x4 pivotWorld = getGlobalTransform(localMatrices, parentIds, jointFlags, pivot);
+            Vector3 pivotPos = pivotWorld.Translation;
+            Vector3 currentTipPos = getGlobalTransform(localMatrices, parentIds, jointFlags, tip).Translation;
+
+            Vector3 currentDir = currentTipPos - pivotPos;
+            Vector3 targetDir = targetPosition - pivotPos;
+            if (currentDir.LengthSquared() < 1e-10f || targetDir.LengthSquared() < 1e-10f)
+                return;
+            currentDir = Vector3.Normalize(currentDir);
+            targetDir = Vector3.Normalize(targetDir);
+
+            Vector3 axis = Vector3.Cross(currentDir, targetDir);
+            if (axis.LengthSquared() < 1e-12f)
+                return; // already aligned (or exactly opposite - ambiguous either way, leave it)
+            axis = Vector3.Normalize(axis);
+
+            float angle = MathF.Acos(Math.Clamp(Vector3.Dot(currentDir, targetDir), -1f, 1f));
+            Quaternion delta = Quaternion.CreateFromAxisAngle(axis, angle);
+            setGlobalTransform(localMatrices, parentIds, jointFlags, pivot, rotateGlobalAroundOwnPosition(pivotWorld, delta));
+        }
+
+        // Applies an Up-Vector constraint: twists 'joint' around its own aim axis (local +X, see
+        // buildLocalMatrix/the bind-pose translations - this rig's bone-length axis) so its local Y axis points
+        // as closely as possible at 'targetPosition'. Twisting around the aim axis specifically (rather than
+        // picking some other rotation) is what makes this compatible with whatever already aimed the joint - a
+        // bend/aim chain, another constraint, or just its baked FCurve rotation - since a rotation around that
+        // axis leaves points lying along it (i.e. the joint's own child) exactly where they already were.
+        private static void applyUpVectorTwist(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int joint, Vector3 targetPosition)
+        {
+            Matrix4x4 jointWorld = getGlobalTransform(localMatrices, parentIds, jointFlags, joint);
+            Matrix4x4.Decompose(jointWorld, out Vector3 scale, out Quaternion currentRotation, out Vector3 jointPos);
+
+            Vector3 aimAxisWorld = Vector3.Transform(Vector3.UnitX, currentRotation);
+            Vector3 desiredUpDir = targetPosition - jointPos;
+            Vector3 desiredUpProjected = desiredUpDir - aimAxisWorld * Vector3.Dot(desiredUpDir, aimAxisWorld);
+            if (desiredUpProjected.LengthSquared() < 1e-10f)
+                return; // up-vector target lies on the aim axis itself - no roll information to extract
+            desiredUpProjected = Vector3.Normalize(desiredUpProjected);
+
+            Vector3 currentUpWorld = Vector3.Transform(Vector3.UnitY, currentRotation);
+            Vector3 currentUpProjected = currentUpWorld - aimAxisWorld * Vector3.Dot(currentUpWorld, aimAxisWorld);
+            if (currentUpProjected.LengthSquared() < 1e-10f)
+                return;
+            currentUpProjected = Vector3.Normalize(currentUpProjected);
+
+            float angle = MathF.Acos(Math.Clamp(Vector3.Dot(currentUpProjected, desiredUpProjected), -1f, 1f));
+            float sign = Vector3.Dot(Vector3.Cross(currentUpProjected, desiredUpProjected), aimAxisWorld) < 0f ? -1f : 1f;
+            Quaternion twist = Quaternion.CreateFromAxisAngle(aimAxisWorld, angle * sign);
+            Quaternion newRotation = Quaternion.Normalize(twist * currentRotation);
+
+            setGlobalTransform(localMatrices, parentIds, jointFlags, joint,
+                Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(newRotation) * Matrix4x4.CreateTranslation(jointPos));
         }
 
         // Rotates a joint's world-space orientation by 'delta' while keeping its own position fixed (rotating a
