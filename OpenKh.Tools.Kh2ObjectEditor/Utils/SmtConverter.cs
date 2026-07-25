@@ -896,6 +896,18 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
             if (curve.KeyCount == 0)
                 return 0f;
 
+            // Before the first key, hold its value rather than falling into the loop below: with index==0
+            // never satisfying "index > 0", the loop's not-found path treats the first key as "leftKey" and
+            // extrapolates the first segment's curve using whatever wildly out-of-[0,1]-range n that produces
+            // (verified against the PS2 emulator: a curve starting at frame 42 queried at frame 0 produced
+            // n = -10.5 through a Hermite segment with a real tangent, giving a result off by tens of thousands
+            // of units, while the real engine simply holds the first key's value). Symmetric with how querying
+            // past the last key already resolves to holding that key's value (see the loop's own comment).
+            Motion.Key firstKey = motionFile.FCurveKeys[curve.KeyStartId];
+            float firstKeyTime = motionFile.KeyTimes[(ushort)firstKey.Type_Time >> 2];
+            if (frameTime <= firstKeyTime)
+                return motionFile.KeyValues[firstKey.ValueId];
+
             for (int index = curve.KeyCount - 1; index >= 0; index--)
             {
                 Motion.Key leftKey = motionFile.FCurveKeys[curve.KeyStartId + index];
