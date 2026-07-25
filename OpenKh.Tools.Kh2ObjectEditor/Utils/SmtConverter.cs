@@ -407,31 +407,50 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                             aimChildTowardTarget(localMatrices, parentIds, jointFlags, jointId, tip, targetPosition);
                         }
 
-                    if (!tipHandledByBend.Contains(jointId) && constraintsByTarget.TryGetValue(jointId, out List<Motion.Constraint> constraints))
+                    if (constraintsByTarget.TryGetValue(jointId, out List<Motion.Constraint> constraints))
                         foreach (Motion.Constraint constraint in constraints)
+                        {
+                            // A bend/aim-chain tip's Position constraint is already satisfied by the bend/aim
+                            // itself (that's the whole point of it being a tip) - applying it again would be
+                            // redundant, not wrong, but skip it for clarity. Any OTHER constraint type on the same
+                            // joint (Orientation, Scale, ...) is independent of the position solve and must still
+                            // run: a joint can legitimately carry both a Position AND an Orientation constraint
+                            // from the same source (a full rigid lock, not a free "stretch to position" rope
+                            // link), and the bend/aim machinery only ever resolves the position side of that.
+                            if (tipHandledByBend.Contains(jointId) && (Motion.ConstraintType)constraint.Type == Motion.ConstraintType.POSITION)
+                                continue;
                             applyConstraint(motionFile, localMatrices, parentIds, jointFlags, constraint, keyTime);
+                        }
                 }
 
-                // Pass 3: getGlobalTransform's "rotation absolute" handling (see its own comment) only affects
-                // reads made *during* this function - every downstream consumer of the localMatrices this
-                // function returns (the renderer, callers of this function) does a plain parent-chain FK
-                // composition with no idea that flag exists. Bake the correction into the stored local matrix
-                // itself, for every such joint, so plain composition reproduces the same result.
-                for (int i = 0; i < totalJointCount; i++)
+                // Pass 3: for every OTHER joint (no flag 0x8), Pass 1/2 already stored each joint's true semantic
+                // local Scale/Rotation/Translation, untouched - and the real downstream consumer of this
+                // function's return value (SimpleModelingToolkit's Armature: GetSmtScene decomposes each joint's
+                // matrix into separate Scale/Rotation/Translation keyframes and composes its own hierarchy from
+                // those channels, the same Scale/Rotation-separate way getGlobalTRS does) reproduces the exact
+                // correct world transform straight from that, with no rebaking needed at all. Only flag 0x8
+                // needs a rebake here: its "decoupled from parent" behavior (see getGlobalTRS) is known only to
+                // this function's own internal reads: an unaware consumer would still compose
+                // worldScale = parentWorldScale * storedLocalScale and worldRotation = parentWorldRotation *
+                // storedLocalRotation like any other joint. Pre-compensate by storing localScale/parentWorldScale
+                // and Inverse(parentWorldRotation) * localRotation instead, so that ordinary composition on the
+                // consumer's side reproduces the decoupled scale/rotation exactly. Translation needs no such
+                // compensation - flag 0x8 only decouples scale and rotation, translation already composes the
+                // same way in both cases (see getGlobalTRS).
+                foreach (Motion.Joint joint in motionFile.Joints)
                 {
-                    if ((jointFlags[i] & 0x8) == 0)
-                        continue;
-
-                    Matrix4x4 desiredWorld = getGlobalTransform(localMatrices, parentIds, jointFlags, i);
+                    int i = joint.JointId;
                     int parent = parentIds[i];
-                    if (parent < 0)
-                    {
-                        localMatrices[i] = desiredWorld;
+                    if ((jointFlags[i] & 0x8) == 0 || parent < 0)
                         continue;
-                    }
 
-                    Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, jointFlags, parent), out Matrix4x4 parentWorldInverse);
-                    localMatrices[i] = desiredWorld * parentWorldInverse;
+                    Matrix4x4.Decompose(localMatrices[i], out Vector3 trueLocalScale, out Quaternion trueLocalRotation, out Vector3 trueLocalTranslation);
+                    var parentTrs = getGlobalTRS(localMatrices, parentIds, jointFlags, parent);
+
+                    Vector3 compensatedScale = trueLocalScale / parentTrs.Scale;
+                    Quaternion compensatedRotation = Quaternion.Normalize(Quaternion.Inverse(parentTrs.Rotation) * trueLocalRotation);
+
+                    localMatrices[i] = Matrix4x4.CreateScale(compensatedScale) * Matrix4x4.CreateFromQuaternion(compensatedRotation) * Matrix4x4.CreateTranslation(trueLocalTranslation);
                 }
 
                 frameMatrices.Add(keyTime, localMatrices);
@@ -455,7 +474,19 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 new Vector3(helper.RotateX, helper.RotateY, helper.RotateZ),
                 new Vector3(helper.TranslateX, helper.TranslateY, helper.TranslateZ));
 
-        // Resolves a joint's absolute (world-space) transform by walking up through its (mutable) local matrices.
+        // Resolves a joint's absolute (world-space) transform, as separate Scale/Rotation/Translation rather than
+        // a single composed Matrix4x4. This matters whenever an ancestor's scale is non-uniform (verified against
+        // the PS2 emulator on a squash/stretch tail rig where scale reaches 5-10x on one axis): naively chaining
+        // 4x4 matrices (child * parentGlobal) multiplies each joint's linear part (scale*rotation) against the
+        // next, and whenever a child's rotation isn't aligned with its non-uniformly-scaled parent's axes, that
+        // product is no longer expressible as a clean scale-then-rotation - it contains shear, which forcibly
+        // decomposing back into an orthogonal rotation both distorts (rotation ends up wrong) and destroys (scale
+        // silently leaks between axes, verified: a stretched parent's scale showed up permuted onto the wrong
+        // axis of an unrelated, unscaled child two joints down). The real engine instead tracks Scale/Rotation/
+        // Translation independently at every joint and composes each channel on its own - Scale multiplies
+        // component-wise, Rotation composes as quaternions, and Translation is the standard parent-relative
+        // offset - which never produces shear no matter how extreme or misaligned the scale is.
+        //
         // Recursive rather than a single flat pass, since a Constraint can rewrite an ancestor's local matrix
         // *after* a descendant was already visited earlier in Joints order, and later reads must see that update.
         //
@@ -464,25 +495,41 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
         // normally). This matters for a bend chain's tip (e.g. an ankle): once the knee/hip above it are bent to
         // reach the IK target, the tip's baked rotation was never meant to inherit that freshly-solved parent
         // orientation, only to sit at the right world position.
+        private static (Vector3 Scale, Quaternion Rotation, Vector3 Translation) getGlobalTRS(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int index)
+        {
+            Matrix4x4.Decompose(localMatrices[index], out Vector3 localScale, out Quaternion localRotation, out Vector3 localTranslation);
+
+            int parent = parentIds[index];
+            if (parent < 0)
+                return (localScale, localRotation, localTranslation);
+
+            var parentTrs = getGlobalTRS(localMatrices, parentIds, jointFlags, parent);
+            Vector3 worldTranslation = parentTrs.Translation + Vector3.Transform(parentTrs.Scale * localTranslation, parentTrs.Rotation);
+
+            if ((jointFlags[index] & 0x8) != 0)
+                return (localScale, localRotation, worldTranslation);
+
+            Vector3 worldScale = localScale * parentTrs.Scale;
+            Quaternion worldRotation = Quaternion.Normalize(parentTrs.Rotation * localRotation);
+            return (worldScale, worldRotation, worldTranslation);
+        }
+
         private static Matrix4x4 getGlobalTransform(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int index)
         {
             if (index < 0)
                 return Matrix4x4.Identity;
 
-            int parent = parentIds[index];
-            Matrix4x4 composed = parent < 0 ? localMatrices[index] : localMatrices[index] * getGlobalTransform(localMatrices, parentIds, jointFlags, parent);
-
-            if ((jointFlags[index] & 0x8) == 0)
-                return composed;
-
-            Matrix4x4.Decompose(localMatrices[index], out Vector3 scale, out Quaternion localRotation, out _);
-            return Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(localRotation) * Matrix4x4.CreateTranslation(composed.Translation);
+            var (scale, rotation, translation) = getGlobalTRS(localMatrices, parentIds, jointFlags, index);
+            return Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(rotation) * Matrix4x4.CreateTranslation(translation);
         }
 
-        // Back-solves the local matrix needed so that this joint's *global* transform becomes 'global',
-        // given its current parent chain.
+        // Back-solves the local matrix needed so that this joint's *global* transform becomes 'global', given its
+        // current parent chain - the inverse of getGlobalTRS's composition, channel by channel (scale divides,
+        // rotation left-multiplies by the parent's inverse, translation un-rotates and un-scales the offset).
         private static void setGlobalTransform(Matrix4x4[] localMatrices, int[] parentIds, int[] jointFlags, int index, Matrix4x4 global)
         {
+            Matrix4x4.Decompose(global, out Vector3 worldScale, out Quaternion worldRotation, out Vector3 worldTranslation);
+
             int parent = parentIds[index];
             if (parent < 0)
             {
@@ -490,19 +537,23 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                 return;
             }
 
+            var parentTrs = getGlobalTRS(localMatrices, parentIds, jointFlags, parent);
+            Quaternion parentRotInverse = Quaternion.Inverse(parentTrs.Rotation);
+            Vector3 localTranslation = Vector3.Transform(worldTranslation - parentTrs.Translation, parentRotInverse) / parentTrs.Scale;
+
             if ((jointFlags[index] & 0x8) != 0)
             {
-                // Rotation is absolute for this joint: keep it as-is (it isn't derived from the parent), only
-                // back-solve the local translation needed to place it at global's position.
+                // Rotation is absolute for this joint: keep its current local scale/rotation as-is (they aren't
+                // derived from the parent), only back-solve the local translation needed to place it at global's
+                // position.
                 Matrix4x4.Decompose(localMatrices[index], out Vector3 scale, out Quaternion localRotation, out _);
-                Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, jointFlags, parent), out Matrix4x4 parentGlobalInverse);
-                Vector3 localTranslation = Vector3.Transform(global.Translation, parentGlobalInverse);
                 localMatrices[index] = Matrix4x4.CreateScale(scale) * Matrix4x4.CreateFromQuaternion(localRotation) * Matrix4x4.CreateTranslation(localTranslation);
                 return;
             }
 
-            Matrix4x4.Invert(getGlobalTransform(localMatrices, parentIds, jointFlags, parent), out Matrix4x4 parentInverse);
-            localMatrices[index] = global * parentInverse;
+            Vector3 localScale = worldScale / parentTrs.Scale;
+            Quaternion localRotationSolved = Quaternion.Normalize(parentRotInverse * worldRotation);
+            localMatrices[index] = Matrix4x4.CreateScale(localScale) * Matrix4x4.CreateFromQuaternion(localRotationSolved) * Matrix4x4.CreateTranslation(localTranslation);
         }
 
         // FCurvesForward.JointId already matches the combined joint space (bones start at 0); FCurvesInverse.JointId
@@ -632,11 +683,28 @@ namespace OpenKh.Tools.Kh2ObjectEditor.Utils
                         aimDirWorld = Vector3.Normalize(aimDirWorld);
 
                         int parent = parentIds[target];
-                        Vector3 upRef = parent < 0
-                            ? Vector3.UnitY
-                            : Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, getGlobalTransform(localMatrices, parentIds, jointFlags, parent)));
+                        Matrix4x4 parentWorld = parent < 0 ? Matrix4x4.Identity : getGlobalTransform(localMatrices, parentIds, jointFlags, parent);
+                        Vector3 upRef = parent < 0 ? Vector3.UnitY : Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitY, parentWorld));
 
-                        Vector3 zAxis = Vector3.Cross(aimDirWorld, upRef);
+                        // The parent's Y axis is only a well-conditioned up-vector reference when it isn't
+                        // nearly parallel/antiparallel to the aim direction - verified against the PS2 emulator
+                        // on two separate rigs where the aim happens to run almost straight along the parent's Y
+                        // axis: the cross product's magnitude isn't literally zero there (so the old 1e-10
+                        // threshold never caught it), but its *direction* is dominated by floating-point noise,
+                        // producing a roll up to 180 degrees off. Parent's Z axis, being orthogonal to Y, is
+                        // always well-conditioned exactly when Y isn't (an aim direction can't be near-parallel
+                        // to two orthogonal axes at once), so fall back to it whenever the Y-axis configuration
+                        // is anywhere close to degenerate, not just exactly degenerate.
+                        Vector3 zAxis;
+                        if (Math.Abs(Vector3.Dot(aimDirWorld, upRef)) > 0.9f)
+                        {
+                            Vector3 parentZ = parent < 0 ? Vector3.UnitZ : Vector3.Normalize(Vector3.TransformNormal(Vector3.UnitZ, parentWorld));
+                            zAxis = Vector3.Cross(aimDirWorld, parentZ);
+                        }
+                        else
+                        {
+                            zAxis = Vector3.Cross(aimDirWorld, upRef);
+                        }
                         if (zAxis.LengthSquared() < 1e-10f)
                             zAxis = Vector3.Cross(aimDirWorld, Math.Abs(aimDirWorld.Y) < 0.99f ? Vector3.UnitY : Vector3.UnitX);
                         zAxis = Vector3.Normalize(zAxis);
